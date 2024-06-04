@@ -13,7 +13,6 @@ import numpy as np
 import soundfile as sf
 
 from loguru import logger
-from pathlib import Path
 from transformers import AutoTokenizer
 
 from contextlib import asynccontextmanager
@@ -33,12 +32,17 @@ context = {
     "max_length": 2048,
     "compile": True,
     "precision": torch.bfloat16,
+    "ref_json": "ref_data.json",
+    "ref_base": "./references",
+    "decoder_model": None,
+    "llama_queue": None,
+    "llama_tokenizer": None,
 }
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
-    preload_models()
+async def lifespan(_: FastAPI):
+    await preload_models()
     yield
     context.clear()
 
@@ -48,8 +52,6 @@ app = FastAPI(lifespan=lifespan)
 
 class InvokeRequest(BaseModel):
     text: str = "你说的对, 但是原神是一款由米哈游自主研发的开放世界手游."
-    reference_text: Optional[str] = None
-    reference_audio: Optional[str] = None
     max_new_tokens: int = 0
     chunk_length: Annotated[int, Field(ge=0, le=500, strict=True)] = 150
     top_p: Annotated[float, Field(ge=0.1, le=1.0, strict=True)] = 0.7
@@ -59,14 +61,16 @@ class InvokeRequest(BaseModel):
     emotion: Optional[str] = None
     format: Literal["wav", "mp3", "flac"] = "wav"
     streaming: bool = False
-    ref_json: Optional[str] = "ref_data.json"
-    ref_base: Optional[str] = "ref_data"
 
 
-def load_json(json_file):
-    if not json_file:
+def load_json():
+    ref_base = context.get("ref_base")
+    json_file = context.get("ref_json")
+    if not json_file or not ref_base:
         logger.info("Not using a json file")
         return None
+
+    json_file = f"{ref_base}/{json_file}"
     try:
         with open(json_file, "r", encoding="utf-8") as file:
             data = json.load(file)
@@ -77,25 +81,6 @@ def load_json(json_file):
         logger.warning(f"Loading json failed: {e}")
         data = None
     return data
-
-
-def get_ref_paths(base_path, data, speaker, emotion):
-    if base_path and data and speaker and emotion and (Path(base_path).exists()):
-        if speaker in data and emotion in data[speaker]:
-            files = data[speaker][emotion]
-            lab_files = [f for f in files if f.endswith(".lab")]
-            wav_files = [f for f in files if f.endswith(".wav")]
-
-            if lab_files and wav_files:
-                selected_lab = lab_files[0]
-                selected_wav = wav_files[0]
-
-                lab_path = Path(base_path) / speaker / emotion / selected_lab
-                wav_path = Path(base_path) / speaker / emotion / selected_wav
-                if lab_path.exists() and wav_path.exists():
-                    return lab_path, wav_path
-
-    return None, None
 
 
 def encode_reference(*, decoder_model, reference_audio, enable_reference_audio):
@@ -197,35 +182,16 @@ def decode_vq_tokens(
 
 @torch.inference_mode()
 def inference(req: InvokeRequest):
-    # Parse reference audio aka prompt
-    prompt_tokens = None
-
-    ref_data = load_json(req.ref_json)
-    ref_base = req.ref_base
-
-    lab_path, wav_path = get_ref_paths(ref_base, ref_data, req.speaker, req.emotion)
-
-    if lab_path and wav_path:
-        with open(wav_path, "rb") as wav_file:
-            audio_bytes = wav_file.read()
-        with open(lab_path, "r", encoding="utf-8") as lab_file:
-            ref_text = lab_file.read()
-        req.reference_audio = base64.b64encode(audio_bytes).decode("utf-8")
-        req.reference_text = ref_text
-        logger.info("ref_path: " + str(wav_path))
-        logger.info("ref_text: " + ref_text)
-
-    # Parse reference audio aka prompt
+    reference_mapping = context["reference_mapping"]
     decoder_model = context["decoder_model"]
-    prompt_tokens, reference_embedding = encode_reference(
-        decoder_model=decoder_model,
-        reference_audio=(
-            io.BytesIO(base64.b64decode(req.reference_audio))
-            if req.reference_audio is not None
-            else None
-        ),
-        enable_reference_audio=req.reference_audio is not None,
-    )
+
+    reference_tokens = None
+    reference_text = None
+    reference_embedding = None
+
+    references = reference_mapping.get(req.speaker)
+    if references is not None:
+        reference_text, reference_tokens, reference_embedding = references
 
     # LLAMA Inference
     request = dict(
@@ -241,8 +207,8 @@ def inference(req: InvokeRequest):
         chunk_length=req.chunk_length,
         max_length=context["max_length"],
         speaker=req.speaker,
-        prompt_tokens=prompt_tokens,
-        prompt_text=req.reference_text,
+        prompt_tokens=reference_tokens,
+        prompt_text=reference_text,
     )
 
     response_queue = queue.Queue()
@@ -309,15 +275,13 @@ class SpeechRequest(BaseModel):
 
 
 @app.post("/v1/audio/speech")
-def api_infer(req: SpeechRequest):
+async def api_infer(req: SpeechRequest):
     """
     Invoke model and generate audio
     """
     generator = inference(
         InvokeRequest(
             text=req.input,
-            reference_text=None,
-            reference_audio=None,
             max_new_tokens=0,
             chunk_length=150,
             top_p=0.7,
@@ -326,8 +290,6 @@ def api_infer(req: SpeechRequest):
             speaker=req.voice,
             emotion=None,
             format=req.response_format,
-            ref_base=None,
-            ref_json=None,
         )
     )
     fake_audios = next(generator)
@@ -340,7 +302,7 @@ def api_infer(req: SpeechRequest):
     return StreamingResponse(content=[buffer.getvalue()], media_type="audio/wav")
 
 
-def preload_models():
+async def preload_models():
     """
     Preload model
     """
@@ -357,11 +319,36 @@ def preload_models():
     )
     logger.info("Llama model loaded, loading vits model...")
 
-    context["decoder_model"] = load_model(
+    decoder_model = load_model(
         config_name="vits_decoder_finetune",
         checkpoint_path="checkpoints/vits_decoder_v1.1.ckpt",
         device="cuda",
     )
+    context["decoder_model"] = decoder_model
+
+    # Parse reference audio aka prompt
+    reference_mapping = {}
+    context["reference_mapping"] = reference_mapping
+
+    ref_data = load_json()
+    ref_base = context["ref_base"]
+    for speaker, paths in ref_data.items():
+        lab_path, wav_path = paths["ref_lab"], paths["ref_wav"]
+        lab_path = f"{ref_base}/{lab_path}"
+        wav_path = f"{ref_base}/{wav_path}"
+
+        with open(wav_path, "rb") as wav_file:
+            audio_bytes = wav_file.read()
+        with open(lab_path, "r", encoding="utf-8") as lab_file:
+            ref_text = lab_file.read()
+
+        # Parse reference audio aka prompt
+        prompt_tokens, reference_embedding = encode_reference(
+            decoder_model=decoder_model,
+            reference_audio=(io.BytesIO(audio_bytes)),
+            enable_reference_audio=True,
+        )
+        reference_mapping[speaker] = (ref_text, prompt_tokens, reference_embedding)
 
     logger.info("VQ-GAN model loaded, warming up...")
 
@@ -370,8 +357,6 @@ def preload_models():
         inference(
             InvokeRequest(
                 text="A warm-up sentence.",
-                reference_text=None,
-                reference_audio=None,
                 max_new_tokens=0,
                 chunk_length=150,
                 top_p=0.7,
@@ -380,8 +365,6 @@ def preload_models():
                 speaker=None,
                 emotion=None,
                 format="wav",
-                ref_base=None,
-                ref_json=None,
             )
         )
     )
