@@ -308,7 +308,7 @@ async def preload_models():
     """
     context["llama_queue"] = launch_thread_safe_queue(
         config_name="dual_ar_2_codebook_medium",
-        checkpoint_path="checkpoints/text2semantic-sft-medium-v1.1-4k.pth",
+        checkpoint_path="checkpoints/text2semantic-sft-medium.ckpt",
         device="cuda",
         precision=torch.bfloat16,
         max_length=context["max_length"],
@@ -321,7 +321,7 @@ async def preload_models():
 
     decoder_model = load_model(
         config_name="vits_decoder_finetune",
-        checkpoint_path="checkpoints/vits_decoder_v1.1.ckpt",
+        checkpoint_path="checkpoints/vits_decoder.ckpt",
         device="cuda",
     )
     context["decoder_model"] = decoder_model

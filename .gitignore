@@ -9,6 +9,7 @@ __pycache__
 filelists
 /fish_speech/text/cmudict_cache.pickle
 /checkpoints
+/references
 /.vscode
 /data_server/target
 /*.npy
