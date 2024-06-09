@@ -16,7 +16,6 @@ RUN pip3.10 install --no-cache-dir -e .
 
 EXPOSE 8051
 
-VOLUME /work/checkpoints
-VOLUME /work/references
+VOLUME [ "/work/checkpoints", "/work/references" ]
 
 CMD ["fastapi", "run", "main.py", "--host", "0.0.0.0", "--port", "8051"]
