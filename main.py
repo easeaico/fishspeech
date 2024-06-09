@@ -1,31 +1,29 @@
-from typing import Annotated, Optional, Literal
-from pydantic import BaseModel, Field
-from fastapi import FastAPI
-from fastapi.responses import StreamingResponse
-import json
 import io
-import torch
-import base64
-import librosa
+import json
 import queue
 import wave
+from contextlib import asynccontextmanager
+from typing import Annotated, Literal, Optional
+
+import librosa
 import numpy as np
 import soundfile as sf
-
+import torch
+from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
 from loguru import logger
+from pydantic import BaseModel, Field
 from transformers import AutoTokenizer
 
-from contextlib import asynccontextmanager
 from fish_speech.models.vits_decoder.lit_module import VITSDecoder
 from fish_speech.models.vqgan.lit_module import VQGAN
-from tools.vits_decoder.inference import load_model
-
 from tools.llama.generate import (
     GenerateRequest,
     GenerateResponse,
     WrappedGenerateResponse,
     launch_thread_safe_queue,
 )
+from tools.vits_decoder.inference import load_model
 
 context = {
     "device": "cuda",
@@ -63,12 +61,13 @@ class InvokeRequest(BaseModel):
     streaming: bool = False
 
 
-def load_json():
+def load_json() -> dict[str, dict[str, str]]:
+    data: dict[str, dict[str, str]] = {}
     ref_base = context.get("ref_base")
     json_file = context.get("ref_json")
     if not json_file or not ref_base:
         logger.info("Not using a json file")
-        return None
+        return data
 
     json_file = f"{ref_base}/{json_file}"
     try:
@@ -76,10 +75,9 @@ def load_json():
             data = json.load(file)
     except FileNotFoundError:
         logger.warning(f"ref json not found: {json_file}")
-        data = None
     except Exception as e:
         logger.warning(f"Loading json failed: {e}")
-        data = None
+
     return data
 
 
@@ -182,16 +180,24 @@ def decode_vq_tokens(
 
 @torch.inference_mode()
 def inference(req: InvokeRequest):
-    reference_mapping = context["reference_mapping"]
+    reference_mapping: dict[str, tuple[str, bytes]] = context["reference_mapping"]
     decoder_model = context["decoder_model"]
 
     reference_tokens = None
     reference_text = None
     reference_embedding = None
 
-    references = reference_mapping.get(req.speaker)
-    if references is not None:
-        reference_text, reference_tokens, reference_embedding = references
+    if req.speaker is not None:
+        references = reference_mapping.get(req.speaker)
+        if references is not None:
+            reference_text, audio_bytes = references
+
+            # Parse reference audio aka prompt
+            reference_tokens, reference_embedding = encode_reference(
+                decoder_model=decoder_model,
+                reference_audio=(io.BytesIO(audio_bytes)),
+                enable_reference_audio=True,
+            )
 
     # LLAMA Inference
     request = dict(
@@ -327,7 +333,7 @@ async def preload_models():
     context["decoder_model"] = decoder_model
 
     # Parse reference audio aka prompt
-    reference_mapping = {}
+    reference_mapping: dict[str, tuple[str, bytes]] = {}
     context["reference_mapping"] = reference_mapping
 
     ref_data = load_json()
@@ -342,13 +348,7 @@ async def preload_models():
         with open(lab_path, "r", encoding="utf-8") as lab_file:
             ref_text = lab_file.read()
 
-        # Parse reference audio aka prompt
-        prompt_tokens, reference_embedding = encode_reference(
-            decoder_model=decoder_model,
-            reference_audio=(io.BytesIO(audio_bytes)),
-            enable_reference_audio=True,
-        )
-        reference_mapping[speaker] = (ref_text, prompt_tokens, reference_embedding)
+        reference_mapping[speaker] = (ref_text, audio_bytes)
 
     logger.info("VQ-GAN model loaded, warming up...")
 
